@@ -149,12 +149,13 @@ extension Solver {
         let freeMain = innerMain - childMain - marginMainStart - axes.mainEnd(margins)
         let freeCross = innerCross - childCross - marginCrossStart - axes.crossEnd(margins)
 
-        let mainOffset: Double =
-            switch container.justifyContent {
-            case .start, .spaceBetween: 0
-            case .end: freeMain
-            case .center, .spaceAround, .spaceEvenly: freeMain / 2
-            }
+        let mainOffset = distribute(
+            justifyDistribution(container.justifyContent),
+            free: freeMain,
+            count: 1,
+            gap: 0,
+            startIsFlexEnd: container.direction.isReverse
+        ).offset
         let alignment: AlignItems =
             switch nodes[child].style.alignSelf {
             case .auto: container.alignItems

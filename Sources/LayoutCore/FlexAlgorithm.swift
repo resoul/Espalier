@@ -24,6 +24,7 @@ struct FlexItem {
     let align: AlignSelf
     let ratio: Double?
     let crossForBasis: Double?
+    let mainIsDefinite: Bool
 
     var basis = 0.0
     var hypotheticalMain = 0.0
@@ -59,6 +60,7 @@ struct ContainerAxes {
     init(style: FlexStyle, direction: LayoutDirection, own: OwnSize) {
         isRow = style.direction.isRow
         let rtl = direction == .rightToLeft
+
         reversedMain = isRow ? style.direction.isReverse != rtl : style.direction.isReverse
         reversedCross = (style.wrap == .wrapReverse) != (!isRow && rtl)
         mainGap = max(0, isRow ? style.columnGap : style.rowGap)
@@ -100,12 +102,19 @@ extension Solver {
         parent: OptionalSize,
         available: AvailableSize,
         mode: RunMode,
-        contentOnly: Bool = false
+        contentOnly: Bool = false,
+        definite: DefiniteAxes = .both
     ) throws -> LayoutSize {
         try context.checkpoint()
         let node = nodes[index]
         let style = node.style
-        let own = ownSize(index, known: known, parent: parent, contentOnly: contentOnly)
+        let own = ownSize(
+            index,
+            known: known,
+            parent: parent,
+            contentOnly: contentOnly,
+            definite: definite
+        )
         let axes = ContainerAxes(style: style, direction: node.direction, own: own)
         let isRow = axes.isRow
         let ownMain = isRow ? own.width : own.height
@@ -124,11 +133,11 @@ extension Solver {
             innerCrossDefinite.map { AvailableSpace.definite($0) }
             ?? (isRow ? available.height : available.width).shrunk(by: axes.paddingCross)
 
-        let itemParent = OptionalSize(
-            main: innerMainDefinite,
-            cross: innerCrossDefinite,
-            isRow: isRow
-        )
+        let percentMain = (isRow ? own.definiteWidth : own.definiteHeight)
+            .map { max(0, $0 - axes.paddingMain) }
+        let percentCross = (isRow ? own.definiteHeight : own.definiteWidth)
+            .map { max(0, $0 - axes.paddingCross) }
+        let itemParent = OptionalSize(main: percentMain, cross: percentCross, isRow: isRow)
 
         let flowChildren = node.children.enumerated()
             .filter { nodes[$0.element].style.position != .absolute }
@@ -149,8 +158,6 @@ extension Solver {
                     container: style,
                     axes: axes,
                     itemParent: itemParent,
-                    innerMainDefinite: innerMainDefinite,
-                    innerCrossDefinite: innerCrossDefinite,
                     availableMain: itemsAvailableMain,
                     availableCross: itemsAvailableCross
                 )
@@ -169,22 +176,39 @@ extension Solver {
         if let definite = innerMainDefinite {
             innerMain = definite
         } else {
-            var content =
-                lines.map { lineOuterHypothetical($0, items, gap: axes.mainGap) }.max() ?? 0
-            if case let .definite(space) = itemsAvailableMain, content > space + epsilon {
-                let minContent = try compute(
-                    index,
-                    known: known,
-                    parent: parent,
-                    available: AvailableSize(
-                        main: .minContent,
-                        cross: isRow ? available.height : available.width,
-                        isRow: isRow
-                    ),
-                    mode: .size,
-                    contentOnly: contentOnly
-                )
-                content = max(axes.main(minContent) - axes.paddingMain, space)
+            var content: Double
+            if isRow {
+                let gaps = axes.mainGap * Double(max(0, items.count - 1))
+                var maxContent = gaps
+                var minContentSum = gaps
+                var minContentLargest = 0.0
+                for item in items {
+                    let maxRaw = try rawContribution(
+                        item,
+                        .maxContent,
+                        axes: axes,
+                        itemParent: itemParent
+                    )
+                    let minRaw = try rawContribution(
+                        item,
+                        .minContent,
+                        axes: axes,
+                        itemParent: itemParent
+                    )
+                    maxContent += flexedContribution(item, maxRaw)
+                    minContentSum += flexedContribution(item, minRaw)
+                    minContentLargest = max(minContentLargest, plainContribution(item, minRaw))
+                }
+                let minContent = style.wrap == .noWrap ? minContentSum : minContentLargest
+                maxContent = max(maxContent, minContent)
+                switch itemsAvailableMain {
+                case .maxContent: content = maxContent
+                case .minContent: content = minContent
+                case let .definite(space): content = min(maxContent, max(minContent, space))
+                }
+            } else {
+                content =
+                    lines.map { lineOuterHypothetical($0, items, gap: axes.mainGap) }.max() ?? 0
             }
             innerMain = max(
                 0,
@@ -269,15 +293,18 @@ extension Solver {
                 &items,
                 innerMain: innerMain,
                 gap: axes.mainGap,
-                justify: style.justifyContent
+                justify: style.justifyContent,
+                startIsFlexEnd: style.direction.isReverse
             )
         }
 
+        let linesFree = innerCross - lines.reduce(0) { $0 + $1.crossSize } - crossGaps
         let lineOffsets = distribute(
             singleLine ? .start : contentDistribution(style.alignContent),
-            free: innerCross - lines.reduce(0) { $0 + $1.crossSize } - crossGaps,
+            free: linesFree,
             count: lines.count,
-            gap: axes.crossGap
+            gap: axes.crossGap,
+            startIsFlexEnd: style.wrap == .wrapReverse
         )
         var lineCursor = lineOffsets.offset
         for lineIndex in lines.indices {
@@ -311,6 +338,9 @@ extension Solver {
                 height: isRow ? item.cross : item.target
             )
             frames[item.node] = frame
+
+            let stretched =
+                item.align == .stretch && item.sizeCross == nil && !item.hasAutoCrossMargin
             _ = try compute(
                 item.node,
                 known: OptionalSize(width: frame.size.width, height: frame.size.height),
@@ -319,7 +349,12 @@ extension Solver {
                     width: .definite(frame.size.width),
                     height: .definite(frame.size.height)
                 ),
-                mode: .layout(frame.origin)
+                mode: .layout(frame.origin),
+                definite: DefiniteAxes(
+                    main: item.mainIsDefinite,
+                    cross: item.sizeCross != nil || stretched,
+                    isRow: isRow
+                )
             )
         }
 
@@ -340,15 +375,13 @@ extension Solver {
         container: FlexStyle,
         axes: ContainerAxes,
         itemParent: OptionalSize,
-        innerMainDefinite: Double?,
-        innerCrossDefinite: Double?,
         availableMain: AvailableSpace,
         availableCross: AvailableSpace
     ) throws -> FlexItem {
         let node = nodes[child]
         let style = node.style
         let isRow = axes.isRow
-        let own = ownSize(child, known: OptionalSize(), parent: itemParent)
+        let own = ownSize(child, known: OptionalSize(), parent: itemParent, transferRatio: false)
         let margin = style.margin.physical(node.direction)
         let margins = Physical(
             top: margin.top.points,
@@ -383,7 +416,8 @@ extension Solver {
         let marginsCross = axes.crossStart(margins) + axes.crossEnd(margins)
 
         var crossForBasis = sizeCross
-        if crossForBasis == nil, container.wrap == .noWrap, let innerCross = innerCrossDefinite,
+        if crossForBasis == nil, container.wrap == .noWrap,
+            let innerCross = isRow ? itemParent.height : itemParent.width,
             align == .stretch, !autoCross
         {
             crossForBasis = clamp(innerCross - marginsCross, minCross, maxCross, paddingCross)
@@ -412,14 +446,16 @@ extension Solver {
             shrink: max(0, style.shrink),
             align: align,
             ratio: ratio,
-            crossForBasis: crossForBasis
+            crossForBasis: crossForBasis,
+            mainIsDefinite: sizeMain != nil || (isRow ? itemParent.width : itemParent.height) != nil
         )
+        let measureDefinite = DefiniteAxes(main: false, cross: crossForBasis != nil, isRow: isRow)
 
         let crossAvailable =
             crossForBasis.map { AvailableSpace.definite($0) }
             ?? availableCross.shrunk(by: marginsCross)
 
-        if let basis = style.basis.resolve(innerMainDefinite) {
+        if let basis = style.basis.resolve(isRow ? itemParent.width : itemParent.height) {
             item.basis = basis
         } else if let size = sizeMain {
             item.basis = size
@@ -435,7 +471,9 @@ extension Solver {
                     cross: crossAvailable,
                     isRow: isRow
                 ),
-                mode: .size
+                mode: .size,
+                contentOnly: true,
+                definite: measureDefinite
             )
             item.basis = axes.main(measured)
         }
@@ -448,19 +486,52 @@ extension Solver {
                 parent: itemParent,
                 available: AvailableSize(main: .minContent, cross: crossAvailable, isRow: isRow),
                 mode: .size,
-                contentOnly: true
+                contentOnly: true,
+                definite: measureDefinite
             )
             var suggestion = min(axes.main(minContent), item.maxMain)
             if let specified = sizeMain {
                 suggestion = min(suggestion, specified)
-            } else if let ratio, let cross = crossForBasis {
-                suggestion = min(suggestion, cross * ratio)
             }
             item.minMain = suggestion
         }
 
+        item.basis = max(item.basis, item.paddingMain)
         item.hypotheticalMain = clamp(item.basis, item.minMain, item.maxMain, item.paddingMain)
         return item
+    }
+
+    private mutating func rawContribution(
+        _ item: FlexItem,
+        _ constraint: AvailableSpace,
+        axes: ContainerAxes,
+        itemParent: OptionalSize
+    ) throws -> Double {
+        if let specified = item.sizeMain { return specified }
+
+        let measured = try compute(
+            item.node,
+            known: OptionalSize(main: nil, cross: item.crossForBasis, isRow: axes.isRow),
+            parent: itemParent,
+            available: AvailableSize(
+                main: constraint,
+                cross: item.crossForBasis.map { .definite($0) } ?? .maxContent,
+                isRow: axes.isRow
+            ),
+            mode: .size,
+            definite: DefiniteAxes(main: false, cross: item.crossForBasis != nil, isRow: axes.isRow)
+        )
+        return axes.main(measured)
+    }
+
+    private func plainContribution(_ item: FlexItem, _ raw: Double) -> Double {
+        clamp(raw, item.minMain, item.maxMain, item.paddingMain) + item.marginsMain
+    }
+
+    private func flexedContribution(_ item: FlexItem, _ raw: Double) -> Double {
+        let cannotReach =
+            (raw > item.basis && item.grow == 0) || (raw < item.basis && item.shrink == 0)
+        return plainContribution(item, cannotReach ? item.basis : raw)
     }
 
     private func collectLines(
@@ -553,7 +624,6 @@ extension Solver {
                             items[index].basis + remaining * items[index].grow / factorSum
                     }
                 } else {
-                    // Shrinking is weighted by the inner (content-box) flex base size.
                     let scaled = unfrozen.map {
                         items[$0].shrink * max(0, items[$0].basis - items[$0].paddingMain)
                     }
@@ -602,10 +672,6 @@ extension Solver {
     ) throws -> Double {
         if let size = item.sizeCross { return size }
 
-        if let ratio = item.ratio {
-            return clamp(item.target / ratio, item.minCross, item.maxCross, item.paddingCross)
-        }
-
         let crossAvailable =
             innerCrossDefinite.map { AvailableSpace.definite(max(0, $0 - item.marginsCross)) }
             ?? availableCross.shrunk(by: item.marginsCross)
@@ -618,7 +684,8 @@ extension Solver {
                 cross: crossAvailable,
                 isRow: axes.isRow
             ),
-            mode: .size
+            mode: .size,
+            definite: DefiniteAxes(main: item.mainIsDefinite, cross: false, isRow: axes.isRow)
         )
         return clamp(axes.cross(measured), item.minCross, item.maxCross, item.paddingCross)
     }
@@ -628,7 +695,8 @@ extension Solver {
         _ items: inout [FlexItem],
         innerMain: Double,
         gap: Double,
-        justify: JustifyContent
+        justify: JustifyContent,
+        startIsFlexEnd: Bool
     ) {
         guard !line.isEmpty else { return }
 
@@ -649,7 +717,8 @@ extension Solver {
                 justifyDistribution(justify),
                 free: free,
                 count: line.count,
-                gap: gap
+                gap: gap,
+                startIsFlexEnd: startIsFlexEnd
             )
             cursor = distribution.offset
             spacing = distribution.spacing
@@ -715,9 +784,13 @@ func contentDistribution(_ value: AlignContent) -> Distribution {
     }
 }
 
-func distribute(_ mode: Distribution, free: Double, count: Int, gap: Double) -> (
-    offset: Double, spacing: Double
-) {
+func distribute(
+    _ mode: Distribution,
+    free: Double,
+    count: Int,
+    gap: Double,
+    startIsFlexEnd: Bool
+) -> (offset: Double, spacing: Double) {
     guard count > 0 else { return (0, gap) }
 
     let n = Double(count)
@@ -733,11 +806,11 @@ func distribute(_ mode: Distribution, free: Double, count: Int, gap: Double) -> 
 
         return (0, gap + free / (n - 1))
     case .spaceAround:
-        guard free > 0 else { return (free / 2, gap) }
+        guard free > 0 else { return (startIsFlexEnd ? free : 0, gap) }
 
         return (free / n / 2, gap + free / n)
     case .spaceEvenly:
-        guard free > 0 else { return (free / 2, gap) }
+        guard free > 0 else { return (startIsFlexEnd ? free : 0, gap) }
 
         return (free / (n + 1), gap + free / (n + 1))
     }
