@@ -1,9 +1,14 @@
-
+/// A length that may be absolute, relative to the containing block, or automatic.
+///
+/// Ownership: value type. Isolation: none. Errors: none. Cancellation: not applicable.
 public enum Length: Sendable, Hashable, ExpressibleByIntegerLiteral, ExpressibleByFloatLiteral {
     case auto
     case points(Double)
     case fraction(Double)
 
+    /// A literal means points.
+    ///
+    /// Ownership: value. Isolation: none. Errors: none. Cancellation: not applicable.
     public init(integerLiteral value: Int) {
         self = .points(Double(value))
     }
@@ -92,6 +97,7 @@ public struct Edges<Value: Sendable & Hashable>: Sendable, Hashable {
     }
 }
 
+/// Edges resolved to physical sides.
 struct Physical<Value> {
     var top: Value
     var left: Value
